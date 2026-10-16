@@ -1,0 +1,173 @@
+name: FPL weekly snapshot validation report (data-only)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '44 */4 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fpl-weekly-snapshot-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate immutable data snapshots and generate reports
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path('freezes')
+          snapshots = sorted(root.glob('GW*_2026-27/*/FREEZE_MANIFEST.json')) if root.exists() else []
+          if not snapshots:
+              raise SystemExit('FAIL: No official FPL snapshot manifests found. No report generated.')
+          success, failed, skipped = 0, 0, 0
+          for manifest_path in snapshots:
+              folder = manifest_path.parent
+              relative = folder.relative_to(root)
+              out = Path('reports') / relative / 'DATA_VALIDATION_REPORT.md'
+              machine = out.with_name('DATA_VALIDATION_RESULT.json')
+              if out.exists() or machine.exists():
+                  # Existing report is immutable: do not overwrite it.
+                  skipped += 1
+                  continue
+              failures = []
+              details = {}
+              def check(condition, reason):
+                  if not condition:
+                      failures.append(reason)
+              def digest(path):
+                  return hashlib.sha256(path.read_bytes()).hexdigest()
+
+              required = ('bootstrap-static.json', 'fixtures.json', 'FREEZE_MANIFEST.json', 'SHA256SUMS.txt')
+              for name in required:
+                  check((folder / name).is_file(), 'Missing ' + name)
+              manifest = {}
+              bootstrap = {}
+              fixtures = None
+              if all((folder / name).is_file() for name in required):
+                  try:
+                      manifest = json.loads(manifest_path.read_bytes())
+                      bootstrap = json.loads((folder / 'bootstrap-static.json').read_bytes())
+                      fixtures = json.loads((folder / 'fixtures.json').read_bytes())
+                  except (ValueError, UnicodeError) as e:
+                      failures.append('JSON decode failure: ' + str(e))
+                  for name in ('bootstrap-static.json', 'fixtures.json'):
+                      check(manifest.get('sha256', {}).get(name) == digest(folder / name),
+                            'Manifest SHA256 mismatch: ' + name)
+                  try:
+                      lines = (folder / 'SHA256SUMS.txt').read_text().splitlines()
+                      entries = {}
+                      for line in lines:
+                          m = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9_.-]+)', line)
+                          if not m or m.group(2) in entries:
+                              raise ValueError('Malformed or duplicate SHA256SUMS entry')
+                          entries[m.group(2)] = m.group(1)
+                      for name in required[:3]:
+                          check(entries.get(name) == digest(folder / name),
+                                'SHA256SUMS mismatch/missing: ' + name)
+                  except (ValueError, UnicodeError) as e:
+                      failures.append('SHA256SUMS parse failure: ' + str(e))
+              if manifest and isinstance(bootstrap, dict) and isinstance(fixtures, list):
+                  players = bootstrap.get('elements', [])
+                  teams = bootstrap.get('teams', [])
+                  events = bootstrap.get('events', [])
+                  check(isinstance(players, list) and len(players) >= 400, 'Player count below minimum')
+                  check(isinstance(teams, list) and len(teams) == 20, 'Team count is not 20')
+                  check(isinstance(events, list) and len(events) >= 38, 'Gameweek count below 38')
+                  check(len(fixtures) >= 100, 'Fixture count below minimum')
+                  check(manifest.get('type') == 'OFFICIAL_FPL_DATA_ONLY', 'Not a recognized data-only source manifest')
+                  check(manifest.get('canonical_production_pass') is False, 'Source incorrectly claims canonical Production PASS')
+                  check(manifest.get('player_count') == len(players), 'Player count differs from source manifest')
+                  check(manifest.get('team_count') == len(teams), 'Team count differs from source manifest')
+                  check(manifest.get('fixture_count') == len(fixtures), 'Fixture count differs from source manifest')
+                  check(manifest.get('gameweek') in [e.get('id') for e in events], 'Gameweek not in official event list')
+                  check(manifest.get('slot') == folder.name, 'Slot name mismatch')
+                  try:
+                      event = next(e for e in events if e.get('id') == manifest.get('gameweek'))
+                      expected = dt.datetime.fromisoformat(event['deadline_time'].replace('Z', '+00:00'))
+                      recorded = dt.datetime.fromisoformat(manifest['official_deadline_utc'].replace('Z', '+00:00'))
+                      captured = dt.datetime.fromisoformat(manifest['captured_utc'].replace('Z', '+00:00'))
+                      check(expected == recorded, 'Deadline mismatch versus official bootstrap')
+                      check(captured <= recorded, 'Captured after deadline')
+                      details['captured_utc'] = captured.isoformat()
+                      details['deadline_utc'] = recorded.isoformat()
+                  except (KeyError, ValueError, StopIteration, TypeError) as e:
+                      failures.append('Invalid dates/gameweek: ' + str(e))
+                  try:
+                      ids = {t['id'] for t in teams}
+                      check(all(f.get('team_h') in ids and f.get('team_a') in ids for f in fixtures),
+                            'Fixtures refer to unknown teams')
+                      check(len({p['id'] for p in players}) == len(players), 'Duplicate player IDs')
+                  except (KeyError, TypeError) as e:
+                      failures.append('Invalid player/team keys: ' + str(e))
+                  details.update(player_count=len(players), fixture_count=len(fixtures), team_count=len(teams))
+              else:
+                  failures.append('Unable to validate complete parsed official data')
+
+              status = 'PASS_DATA_INTEGRITY_ONLY' if not failures else 'FAIL_DATA_INTEGRITY'
+              result = {
+                  'status': status,
+                  'canonical_production_pass': False,
+                  'forecast_present': False,
+                  'optimizer_complete': False,
+                  'source_manifest_sha256': digest(manifest_path) if manifest_path.is_file() else None,
+                  'snapshot_directory': str(folder),
+                  'checks': 'Data structure, cross-file consistency, timestamp, SHA256 only',
+                  'failures': failures,
+                  **details,
+              }
+              out.parent.mkdir(parents=True, exist_ok=True)
+              machine.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+              bullet = '\n'.join('- ' + f for f in failures) if failures else '- All available data integrity checks passed.'
+              out.write_text(
+                  '# FPL data snapshot validation — ' + str(relative) + '\n\n'
+                  '**Status:** ' + status + '\n\n'
+                  '**Important:** This validates only archived official FPL data. It is NOT a Production model forecast, an approved R3/R11 executable verification, an Elo provenance certificate, a complete search certificate, or an active-Wildcard optimisation.\n\n'
+                  '## Data inventory\n\n'
+                  '- Player count: ' + str(details.get('player_count', 'unverified')) + '\n'
+                  '- Fixture count: ' + str(details.get('fixture_count', 'unverified')) + '\n'
+                  '- Capture (UTC): ' + str(details.get('captured_utc', 'unverified')) + '\n'
+                  '- Deadline (UTC): ' + str(details.get('deadline_utc', 'unverified')) + '\n'
+                  '- Source manifest SHA256: `' + str(result['source_manifest_sha256']) + '`\n\n'
+                  '## Findings\n\n' + bullet + '\n\n'
+                  '## Next gates for a canonical freeze\n\n'
+                  '- Explicit approval and verification of immutable Production executable.\n'
+                  '- Provenanced historical and forward Elo inputs.\n'
+                  '- Account-verified squad, chip, bank and FT state.\n'
+                  '- Production-grade full-pool forecasts and immutable hashes.\n'
+                  '- Legal chip-aware exhaustive optimizer and completeness certificate.\n'
+              )
+              print(status, folder, '->', out)
+              if failures:
+                  failed += 1
+              else:
+                  success += 1
+          print(f'Validation complete. PASS={success}; FAIL={failed}; existing reports untouched={skipped}')
+          if failed:
+              raise SystemExit('At least one snapshot failed integrity; check committed reports on a subsequent non-failing run or Actions logs.')
+          PY
+      - name: Commit immutable validation reports
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain -- reports/)" ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add reports/
+            git commit -m 'Validate immutable FPL data snapshots (data-only)'
+            git push
+          else
+            echo 'No new reports to commit.'
+          fi
