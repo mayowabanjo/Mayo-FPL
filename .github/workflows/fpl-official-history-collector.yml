@@ -1,0 +1,181 @@
+name: FPL official player history collector (data only)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '07 7,19 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fpl-official-history-collector
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect official historical inputs and verify
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures as cf
+          import datetime as dt
+          import hashlib, json, os, random, re, sys, time
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          
+          BASE = 'https://fantasy.premierleague.com/api/'
+          UTC = dt.timezone.utc
+          sha = lambda b: hashlib.sha256(b).hexdigest()
+          def data(b): return json.loads(b)
+          def fetch(endpoint):
+              request = Request(BASE+endpoint, headers={'User-Agent':'Mozilla/5.0 (compatible; personal-FPL-history/1.0)', 'Accept':'application/json','Referer':'https://fantasy.premierleague.com/'})
+              for attempt in range(4):
+                  try:
+                      with urlopen(request,timeout=35) as r:
+                          raw=r.read()
+                      return raw,data(raw)
+                  except Exception:
+                      if attempt==3: raise
+                      time.sleep((attempt+1)*3)
+          
+          def verified_snapshot():
+              candidates=[]
+              for p in Path('reports').glob('GW*_2026-27/*/DATA_VALIDATION_RESULT.json'):
+                  try:
+                      r=data(p.read_bytes())
+                      if r.get('status')!='PASS_DATA_INTEGRITY_ONLY':continue
+                      src=Path('freezes')/p.relative_to('reports').parent
+                      mpath=src/'FREEZE_MANIFEST.json'
+                      if not mpath.is_file() or r.get('source_manifest_sha256') !=sha(mpath.read_bytes()):continue
+                      m=data(mpath.read_bytes())
+                      if m.get('canonical_production_pass') is not False:continue
+                      checks={'bootstrap-static.json','fixtures.json'}
+                      if not all((src/x).is_file() and m.get('sha256',{}).get(x)==sha((src/x).read_bytes()) for x in checks):continue
+                      candidates.append((dt.datetime.fromisoformat(m['captured_utc'].replace('Z','+00:00')),src,m,mpath))
+                  except (ValueError,KeyError,TypeError):continue
+              if not candidates:raise RuntimeError('No verified source snapshot in freezes/reports; run the two data workflows first')
+              return max(candidates,key=lambda v:v[0])[1:]
+          
+          src,manifest,mpath=verified_snapshot()
+          bootstrap=data((src/'bootstrap-static.json').read_bytes())
+          players=bootstrap['elements']
+          player_ids=sorted(p['id'] for p in players)
+          assert len(player_ids)==len(set(player_ids)) and len(player_ids)>=400
+          now=dt.datetime.now(UTC)
+          finished=[e for e in bootstrap['events'] if e.get('finished') and e.get('id')]
+          # Finished does not guarantee official data_checked. Record this separately.
+          gws=sorted(e['id'] for e in finished)
+          if not gws:raise RuntimeError('No completed gameweeks flagged in bootstrap')
+          sourcehash=sha(mpath.read_bytes())
+          folder=Path('history')/f'source_{sourcehash[:16]}'
+          if folder.exists():
+              print(f'IMMUTABLE: {folder} already exists; no overwrite')
+              sys.exit(0)
+          
+          # Player history is the official match-level record. Preserve the entire response.
+          def get_player(pid):
+              raw,obj=fetch(f'element-summary/{pid}/')
+              if not isinstance(obj,dict) or not isinstance(obj.get('history'),list) or not isinstance(obj.get('history_past'),list):
+                  raise RuntimeError(f'Unexpected element-summary structure for player {pid}')
+              return pid,obj
+          
+          player_results={};player_failures={}
+          with cf.ThreadPoolExecutor(max_workers=4) as executor:
+              futures={executor.submit(get_player,pid):pid for pid in player_ids}
+              for f in cf.as_completed(futures):
+                  pid=futures[f]
+                  try:
+                      _,obj=f.result();player_results[pid]=obj
+                  except Exception as e:player_failures[pid]=str(e)
+          if player_failures:
+              examples=sorted(player_failures.items())[:10]
+              raise RuntimeError(f'FAIL_CLOSED: {len(player_failures)} of {len(player_ids)} element-summary requests failed: {examples}')
+          
+          # Source data can be provisional. Finished/data_checked flags are retained.
+          event_results={};event_failures={}
+          for gw in gws:
+              try:
+                  raw,obj=fetch(f'event/{gw}/live/')
+                  if not isinstance(obj,dict) or not isinstance(obj.get('elements'),list):
+                      raise ValueError('unexpected event live structure')
+                  event_results[gw]=obj
+              except Exception as e:event_failures[gw]=str(e)
+          if event_failures:
+              raise RuntimeError(f'FAIL_CLOSED: official gameweek live unavailable: {event_failures}')
+          
+          # Check no unexpected player IDs, but allow deleted players in historical responses.
+          source_ids=set(player_ids)
+          unknown_rows=[(pid,h.get('element')) for pid,v in player_results.items() for h in v['history'] if h.get('element') not in (pid,None)]
+          if unknown_rows:raise RuntimeError(f'Historical player-element mismatch: {unknown_rows[:5]}')
+          
+          folder.mkdir(parents=True,exist_ok=False)
+          def write(name,obj):
+              raw=(json.dumps(obj,sort_keys=True,separators=(',',':'))+'\n').encode()
+              (folder/name).write_bytes(raw)
+              return sha(raw)
+          playerfile='element_summaries_by_id.json'
+          eventfile='completed_gw_live_by_gw.json'
+          checks={playerfile:write(playerfile,{str(k):v for k,v in sorted(player_results.items())}),eventfile:write(eventfile,{str(k):v for k,v in sorted(event_results.items())})}
+          checked=[e['id'] for e in finished if e.get('data_checked') is True]
+          nonchecked=sorted(set(gws)-set(checked))
+          rows=sum(len(x.get('history',[])) for x in player_results.values())
+          past=sum(len(x.get('history_past',[])) for x in player_results.values())
+          provenance={
+           'kind':'FPL_OFFICIAL_HISTORY_INPUTS_ONLY','canonical_production_pass':False,
+           'r11_forecast_present':False,'elo_history_present':False,'elo_current_present':False,
+           'exact_prior_season_match_level_inputs_confirmed':False,
+           'source_freeze':str(src),'source_manifest_sha256':sourcehash,
+           'retrieved_utc':dt.datetime.now(UTC).isoformat(),
+           'current_season_gameweeks_finished':gws,'gameweeks_data_checked_true':checked,
+           'gameweeks_not_data_checked':nonchecked,
+           'player_count':len(player_ids),'current_season_player_match_rows':rows,
+           'prior_season_player_aggregates_rows':past,
+           'source_endpoints':['https://fantasy.premierleague.com/api/element-summary/{id}/','https://fantasy.premierleague.com/api/event/{gw}/live/'],
+           'sha256':checks,
+           'warnings':['Official player history may change after match corrections; snapshot is immutable but not necessarily final.',
+           'history_past is season-level aggregate, NOT detailed prior-season matches.',
+           'Elo and accepted historical/prior modelling contract are NOT supplied.',
+           'Player histories for current listed IDs may omit removed players; historical complete-player-universe is not established.',
+           'Fixture-specific match modelling features and zero-inclusive Core reconciliation require separate validation.']
+          }
+          write('HISTORY_MANIFEST.json',provenance)
+          files=sorted(p for p in folder.iterdir() if p.is_file())
+          (folder/'SHA256SUMS.txt').write_text(''.join(f'{sha(f.read_bytes())}  {f.name}\n' for f in files))
+          report=Path('reports')/'historical'/f'{folder.name}.md'
+          report.parent.mkdir(parents=True,exist_ok=True)
+          report.write_text('\n'.join([
+           '# Official FPL historical data collection',
+           '','**Status: PASS_COLLECTION_INTEGRITY_ONLY**','',
+           f'- Source snapshot: `{src}`',
+           f'- Retrieved UTC: `{provenance["retrieved_utc"]}`',
+           f'- Players with element-summary response: **{len(player_results)} / {len(player_ids)}**',
+           f'- Current-season history rows: **{rows}**',
+           f'- Prior-season aggregate rows: **{past}**',
+           f'- Completed gameweeks captured: **{gws}**',
+           f'- Gameweeks not marked `data_checked`: **{nonchecked}**',
+           '- **R11 live-input completeness: NOT CERTIFIED**',
+           '- **Production promotion: NOT AUTHORISED**',
+           '- **Historical/current Elo: MISSING**',
+           '- No forecasting or optimizer outputs were generated.',
+           '','Each input JSON file has SHA256 in HISTORY_MANIFEST.json and SHA256SUMS.txt.',
+           '','This workflow makes no claim that all R11 historical feature contracts or prior seasons are satisfied.'
+          ])+'\n')
+          print(f'CREATED {folder} rows={rows} prior_aggregate_rows={past}, checked_GWs={checked}, unchecked_GWs={nonchecked}')
+          PY
+      - name: Commit immutable collected history
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain -- history/ reports/historical/)" ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add history/ reports/historical/
+            git commit -m 'Collect official player history (data only)'
+            git push
+          else
+            echo 'No new history to commit'
+          fi
