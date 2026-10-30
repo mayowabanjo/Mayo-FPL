@@ -1,0 +1,15 @@
+{
+  "canonical_production_pass": false,
+  "captured_utc": "2026-10-30T01:23:39.678918+00:00",
+  "checks": "Data structure, cross-file consistency, timestamp, SHA256 only",
+  "deadline_utc": "2026-10-31T11:00:00+00:00",
+  "failures": [],
+  "fixture_count": 380,
+  "forecast_present": false,
+  "optimizer_complete": false,
+  "player_count": 669,
+  "snapshot_directory": "freezes/GW09_2026-27/early",
+  "source_manifest_sha256": "547a12510c6734787192f7dc2fb2e82c7ede2cef2bf3c6e848131e9229c5cc69",
+  "status": "PASS_DATA_INTEGRITY_ONLY",
+  "team_count": 20
+}
