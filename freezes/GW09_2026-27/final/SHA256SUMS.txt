@@ -1,0 +1,3 @@
+cd8b6dbb9f66072abb8f9b0f9e6fcb11bb7efc115af048c3366dcacd2b6d878a  bootstrap-static.json
+97f982774008b950cc2414890c07582fedf82c549b8327fb4ef9d4c415c37ae8  fixtures.json
+1ed5450f39f1bef67032dae8dbe652c0fe66ac8fecaa9dc1d93f8628b479dbcd  FREEZE_MANIFEST.json
