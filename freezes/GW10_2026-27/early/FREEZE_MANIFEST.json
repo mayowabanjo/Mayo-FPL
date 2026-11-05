@@ -1,0 +1,27 @@
+{
+  "canonical_production_pass": false,
+  "captured_utc": "2026-11-05T09:20:33.569647+00:00",
+  "fixture_count": 380,
+  "gameweek": 10,
+  "github_run_attempt": "1",
+  "github_run_id": "42001563304",
+  "hours_before_deadline": 33.157,
+  "limitations": "Data only: no R3/R11 approval, Elo proof, current private squad, Wildcard search, or model predictions certified.",
+  "official_deadline_utc": "2026-11-06T18:30:00+00:00",
+  "optimizer_completeness_certificate_present": false,
+  "player_count": 670,
+  "production_forecast_present": false,
+  "release": "data-freeze-v1",
+  "sha256": {
+    "bootstrap-static.json": "cd000ba208348db7034b97e32c0d9fe89b47c67544499ae9d7cf87ffa45155ae",
+    "fixtures.json": "21380a7c757c88115650449f3e7fbd7d81ddb5fd53f5261117fcc9fa6fdc43e2"
+  },
+  "slot": "early",
+  "sources": {
+    "bootstrap-static.json": "https://fantasy.premierleague.com/api/bootstrap-static/",
+    "fixtures.json": "https://fantasy.premierleague.com/api/fixtures/"
+  },
+  "team_count": 20,
+  "type": "OFFICIAL_FPL_DATA_ONLY",
+  "user_squad_state_present": false
+}
